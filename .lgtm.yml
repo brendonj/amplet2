@@ -1,0 +1,13 @@
+extraction:
+  cpp:
+    prepare:
+      packages:
+        - wget
+        - dpkg
+    after_prepare:
+      - wget https://dl.bintray.com/wand/amp/pool/bionic/main/libwandevent/libwandevent_3.0.2-3_amd64.deb
+      - wget https://dl.bintray.com/wand/amp/pool/bionic/main/libwandevent-dev/libwandevent-dev_3.0.2-3_amd64.deb
+      - dpkg -x libwandevent_3.0.1-1_amd64.deb .
+      - dpkg -x libwandevent-dev_3.0.1-1_amd64.deb .
+      - export CFLAGS=-I$LGTM_SRC/usr/include
+      - export LDFLAGS=-L$LGTM_SRC/usr/lib
