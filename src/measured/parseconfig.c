@@ -56,6 +56,7 @@
 #include "acl.h"
 #include "dscp.h"
 #include "rabbitcfg.h"
+#include "modules.h"
 
 
 
@@ -309,7 +310,7 @@ amp_control_t* get_control_config(cfg_t *cfg, amp_test_meta_t *meta) {
     cfg_sub = cfg_getsec(cfg, "control");
 
     if ( cfg_sub ) {
-        control = (amp_control_t *) malloc(sizeof(amp_control_t));
+        control = (amp_control_t *) calloc(1, sizeof(amp_control_t));
 
         control->acl = initialise_acl();
         control->enabled = cfg_getbool(cfg_sub, "enabled");
@@ -547,6 +548,40 @@ struct ub_ctx* get_dns_context_config(cfg_t *cfg, amp_test_meta_t *meta) {
 
 
 /*
+ *
+ */
+void get_default_test_args(cfg_t *cfg) {
+    cfg_t *cfg_defaults;
+    int i;
+
+    for ( i = 0; i < cfg_size(cfg, "defaults"); i++ ) {
+        test_t *test;
+
+        cfg_defaults = cfg_getnsec(cfg, "defaults", i);
+
+        /* get test name from section heading */
+        test = get_test_by_name((char*)cfg_title(cfg_defaults));
+
+        if ( test == NULL ) {
+            Log(LOG_WARNING, "Default arguments for unknown test '%s'",
+                    cfg_title(cfg_defaults));
+            continue;
+        }
+
+        /* parse and store default arguments */
+        if ( test->server_callback ) {
+            test->server_params =
+                parse_param_string(cfg_getstr(cfg_defaults, "server"));
+        }
+
+        test->client_params =
+            parse_param_string(cfg_getstr(cfg_defaults, "client"));
+    }
+}
+
+
+
+/*
  * Parse the config and set the generic options that we know are always
  * required. These options to into the global vars structure, which is slowly
  * being phased out as I figure out how to place the variables in the
@@ -588,6 +623,7 @@ cfg_t* parse_config(char *filename, struct amp_global_t *vars) {
         CFG_STR("exchange", "amp_exchange", CFGF_NONE),
         CFG_STR("routingkey", "test", CFGF_NONE),
         CFG_BOOL("ssl", -1, CFGF_NONE),
+        CFG_INT("prefetch", DEFAULT_SHOVEL_PREFETCH_COUNT, CFGF_NONE),
         /* deprecated, will be ignored if global ssl options are set */
         CFG_STR("cacert", NULL, CFGF_NONE),
         CFG_STR("key", NULL, CFGF_NONE),
@@ -623,6 +659,12 @@ cfg_t* parse_config(char *filename, struct amp_global_t *vars) {
         CFG_END()
     };
 
+    cfg_opt_t opt_defaults[] = {
+        CFG_STR("client", NULL, CFGF_NONE),
+        CFG_STR("server", NULL, CFGF_NONE),
+        CFG_END()
+    };
+
     cfg_opt_t measured_opts[] = {
 	CFG_STR("ampname", NULL, CFGF_NONE),
 	CFG_STR("interface", NULL, CFGF_NONE),
@@ -636,6 +678,8 @@ cfg_t* parse_config(char *filename, struct amp_global_t *vars) {
 	CFG_SEC("collector", opt_collector, CFGF_NONE),
         CFG_SEC("remotesched", opt_remotesched, CFGF_NONE),
         CFG_SEC("control", opt_control, CFGF_NONE),
+        CFG_SEC("defaults", opt_defaults, CFGF_TITLE | CFGF_MULTI),
+        CFG_FUNC("include", &cfg_include),
 	CFG_END()
     };
 
@@ -694,6 +738,7 @@ cfg_t* parse_config(char *filename, struct amp_global_t *vars) {
         vars->vhost = strdup(cfg_getstr(cfg_sub, "vhost"));
         vars->exchange = strdup(cfg_getstr(cfg_sub, "exchange"));
         vars->routingkey = strdup(cfg_getstr(cfg_sub, "routingkey"));
+        vars->prefetch = cfg_getint(cfg_sub, "prefetch");
 
         if ( (int)cfg_getbool(cfg_sub, "ssl") == -1 ) {
             /* ssl isn't set, try to guess based on the port if it is needed */

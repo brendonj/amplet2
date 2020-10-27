@@ -19,9 +19,39 @@ set -e
 
 CONFDIR="/etc/amplet2"
 CLIENTDIR="$CONFDIR/clients"
+KEYDIR="$CONFDIR/keys"
+LOGDIR="/var/log/amplet2"
+USER="amplet"
 
 case "$1" in
     configure)
+        # create the system user that will run the amp tests
+        adduser --quiet --system --group --no-create-home \
+                --home ${CONFDIR} ${USER}
+
+        # Make sure keys directory exists and has the appropriate permissions
+        mkdir -p ${KEYDIR}
+        chmod 2750 ${KEYDIR}
+
+        # the amplet user should own everything in the config directory
+        chown -R ${USER}: ${CONFDIR}
+
+        # some systems expect syslog to own the log files/directories
+        mkdir -p ${LOGDIR}
+        if getent passwd syslog > /dev/null; then
+            chown syslog:adm ${LOGDIR}
+        fi
+
+        # some tests need special capabilities to run
+        setcap 'CAP_NET_RAW=ep CAP_NET_ADMIN=ep CAP_NET_BIND_SERVICE=ep' /usr/sbin/amplet2
+
+        setcap 'CAP_NET_RAW=ep' /usr/bin/amp-fastping
+        setcap 'CAP_NET_RAW=ep' /usr/bin/amp-icmp
+        setcap 'CAP_NET_RAW=ep CAP_NET_ADMIN=ep' /usr/bin/amp-tcpping
+        setcap 'CAP_NET_BIND_SERVICE=ep' /usr/bin/amp-throughput
+        setcap 'CAP_NET_RAW=ep' /usr/bin/amp-trace
+        setcap 'CAP_NET_BIND_SERVICE=ep' /usr/bin/amp-udpstream
+
         # Copy the example client configuration file into place if there
         # isn't already one there. Trying to make it so everything is
         # ready to go for new users without breaking anything that might
@@ -86,20 +116,11 @@ esac
 
 # If this is an upgrade and amplet2-client is enabled, then start the client
 # (which was stopped by the prerm). Debhelper won't do this for us, because
-# --no-start is set. It's fine to try to start the client under wheezy though
-# because failure doesn't get recorded anywhere.
-if [ -x "/usr/bin/deb-systemd-helper" ]; then
-	if deb-systemd-helper debian-installed amplet2-client.service; then
-		if deb-systemd-helper --quiet was-enabled amplet2-client.service; then
-			if [ -x "/etc/init.d/amplet2-client" ]; then
-				invoke-rc.d amplet2-client start || exit $?
-			fi
-		fi
-	fi
-else
-	if [ -x "/etc/init.d/amplet2-client" ]; then
-		invoke-rc.d amplet2-client start || exit $?
-	fi
+# --no-start is set.
+if deb-systemd-helper debian-installed amplet2-client.service; then
+    if deb-systemd-helper --quiet was-enabled amplet2-client.service; then
+        invoke-rc.d amplet2-client start || exit $?
+    fi
 fi
 
 exit 0

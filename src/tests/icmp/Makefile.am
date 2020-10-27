@@ -7,16 +7,18 @@ testdir=$(libdir)/$(PACKAGE)/tests
 
 bin_PROGRAMS=amp-icmp
 amp_icmp_SOURCES=../testmain.c
-amp_icmp_LDADD=icmp.la -L../../common/ -lamp -lprotobuf-c -lunbound -lwandevent
-amp_icmp_LDFLAGS=-Wl,--no-as-needed
+amp_icmp_LDADD=icmp.la -L../../common/ -lamp -lprotobuf-c -lunbound -levent
 
 test_LTLIBRARIES=icmp.la
 icmp_la_SOURCES=icmp.c
 nodist_icmp_la_SOURCES=icmp.pb-c.c
-icmp_la_LDFLAGS=-module -avoid-version -L../../common/ -lamp -lprotobuf-c -lwandevent
+icmp_la_LDFLAGS=-module -avoid-version -L../../common/ -lamp -lprotobuf-c -levent
 
 INCLUDES=-I../ -I../../common/
 
-icmp.pb-c.c: Makefile
+install-exec-hook:
+	setcap 'CAP_NET_RAW=ep' $(DESTDIR)/$(bindir)/amp-icmp
+
+icmp.pb-c.c: icmp.proto
 	protoc-c --c_out=. icmp.proto
 	protoc --python_out=../python/ampsave/tests/ icmp.proto

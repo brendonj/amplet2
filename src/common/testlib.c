@@ -51,6 +51,8 @@
 #include <sys/stat.h>
 #include <signal.h>
 #include <getopt.h>
+#include <linux/net_tstamp.h>
+#include <linux/errqueue.h>
 
 #include <google/protobuf-c/protobuf-c.h>
 
@@ -179,7 +181,7 @@ void free_duped_environ(void) {
 
 /*
  * Reset the handlers and unblock all the signals that we had associated with
- * libwandevent in the parent process so that tests can receive them properly.
+ * libevent in the parent process so that tests can receive them properly.
  * TODO maintain the list of signals dynamically?
  */
 int unblock_signals(void) {
@@ -212,40 +214,183 @@ int unblock_signals(void) {
 }
 
 
+/*
+ * Specific logic for checking, retriving and converting SO_TIMESTAMPING
+ * timestamp value
+ */
+#ifdef HAVE_SOF_TIMESTAMPING_OPT_ID
+inline static int retrieve_timestamping(struct cmsghdr *c, struct timeval *now){
+    struct timestamping_t *ts;
+
+    assert(c);
+    assert(now);
+
+    if ( c->cmsg_type == SO_TIMESTAMPING &&
+            c->cmsg_len >= CMSG_LEN(sizeof(struct timespec)) ) {
+
+        ts = ((struct timestamping_t*)CMSG_DATA(c));
+
+        if ( ts->hardware.tv_sec != 0 ) {
+            now->tv_sec = ts->hardware.tv_sec;
+            now->tv_usec = (ts->hardware.tv_nsec / 1000);
+            /* NOTE, converting timespec to timeval here */
+        } else {
+            now->tv_sec = ts->software.tv_sec;
+            now->tv_usec = (ts->software.tv_nsec / 1000);
+        }
+        return 1;
+    }
+    return 0;
+}
+#endif
+
+
 
 /*
- * Try to get the best timestamp that is available to us, in order of
- * preference: SO_TIMESTAMP, SIOCGSTAMP, gettimeofday().
+ * Specific logic for checking and retriving SO_TIMESTAMP timestamp value
+ */
+#ifdef SO_TIMESTAMP
+inline static int retrieve_timestamp(struct cmsghdr *c, struct timeval *now) {
+    struct timeval *tv;
+    if ( c->cmsg_type == SO_TIMESTAMP &&
+            c->cmsg_len >= CMSG_LEN(sizeof(struct timeval)) ) {
+
+        tv = ((struct timeval*)CMSG_DATA(c));
+        now->tv_sec = tv->tv_sec;
+        now->tv_usec = tv->tv_usec;
+        return 1;
+    }
+    return 0;
+}
+#endif
+
+
+
+/*
+ * Try to get the best timestamp that is available to us,
+ * in order of preference:
+ * SO_TIMESTAMPING (HW then SW), SO_TIMESTAMP, SIOCGSTAMP and gettimeofday().
  */
 static void get_timestamp(int sock, struct msghdr *msg, struct timeval *now) {
     struct cmsghdr *c;
-    struct timeval *tv;
 
     assert(msg);
     assert(now);
 
-#ifdef SO_TIMESTAMP
-    /* try getting the timestamp using SO_TIMESTAMP if available */
+    /*
+     * Only one of SO_TIMESTAMPING or SO_TIMESTAMP will be enabled
+     * so it is safe to just return the first we find
+    */
     for ( c = CMSG_FIRSTHDR(msg); c; c = CMSG_NXTHDR(msg, c) ) {
-        if ( c->cmsg_level != SOL_SOCKET || c->cmsg_type != SO_TIMESTAMP ) {
-            continue;
-        }
-        if ( c->cmsg_len < CMSG_LEN(sizeof(struct timeval)) ) {
-            continue;
-        }
-        tv = ((struct timeval*)CMSG_DATA(c));
-        now->tv_sec = tv->tv_sec;
-        now->tv_usec = tv->tv_usec;
-        return;
-    }
+        if ( c->cmsg_level == SOL_SOCKET ) {
+#ifdef HAVE_SOF_TIMESTAMPING_OPT_ID
+            if ( retrieve_timestamping(c, now) ) {
+                return;
+            }
 #endif
+#ifdef SO_TIMESTAMP
+            if ( retrieve_timestamp(c, now) ) {
+                return;
+            }
+#endif
+        }
+    }
 
     /* next try using SIOCGSTAMP to get a timestamp */
+#ifdef SIOCGSTAMP
     if ( ioctl(sock, SIOCGSTAMP, now) < 0 ) {
+#endif
         /* failing that, call gettimeofday() which we know will work */
         gettimeofday(now, NULL);
+#ifdef SIOCGSTAMP
+    }
+#endif
+}
+
+
+
+#ifdef HAVE_SOF_TIMESTAMPING_OPT_ID
+/*
+ * Tx SO_TIMESTAMPING values are read in the from MSG_ERRQUEUE of the
+ * sending socket, if value exists it is copied into 'sent'
+ */
+static void get_tx_timestamping(int sock, uint32_t packet_id,
+        struct timeval *sent) {
+
+    struct msghdr msg;
+    struct cmsghdr *c;
+    char ancillary[CMSG_SPACE(sizeof(struct timespec) * 10)];
+    int rc;
+    int check;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_control = ancillary;
+    msg.msg_controllen = sizeof(ancillary);
+
+    memset(ancillary, 0, sizeof(ancillary));
+
+    check = 0;
+
+    /*
+     * Even if the timestamp isn't being stored, try to empty the error
+     * queue so there is room for future timestamp mesages. Any messages
+     * seen here should be either directly related to the packet we've
+     * just sent, or are old messages that were too slow arriving and had
+     * been given up on.
+     */
+    do {
+        rc = recvmsg(sock, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
+
+        /* no need to process it if there is nowhere to store the result */
+        if ( rc >= 0 && sent != NULL ) {
+            struct cmsghdr *tsmsg = NULL;
+            struct sock_extended_err *serr = NULL;
+
+            /* we are only expecting to get error queue messages */
+            if ( msg.msg_flags != MSG_ERRQUEUE ) {
+                break;
+            }
+
+            for ( c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c) ) {
+                if ( c->cmsg_level == SOL_SOCKET &&
+                        c->cmsg_type == SO_TIMESTAMPING ) {
+                    /* timestamp message, store it for now in case it's ours */
+                    tsmsg = c;
+                } else if ( (c->cmsg_level == SOL_IP &&
+                            c->cmsg_type == IP_RECVERR) ||
+                            (c->cmsg_level == SOL_IPV6 &&
+                            c->cmsg_type == IPV6_RECVERR)/* ||
+                            (c->cmsg_level == SOL_PACKET &&
+                            c->cmsg_type == PACKET_TX_TIMESTAMP)*/ ) {
+                    /* check for timestamp packet id, and store it if so */
+                    serr = (void *)CMSG_DATA(c);
+                    if ( serr->ee_errno != ENOMSG ||
+                            serr->ee_origin != SO_EE_ORIGIN_TIMESTAMPING ) {
+                        serr = NULL;
+                    }
+                } else {
+                    Log(LOG_DEBUG, "Unknown message on error queue %d/%d",
+                            c->cmsg_level, c->cmsg_type);
+                }
+
+                /* if there is both an id and a timestamp, see if it's ours */
+                if ( serr && tsmsg && serr->ee_data == packet_id ) {
+                    /* yes it's our packet id, use the timestamp value */
+                    retrieve_timestamping(tsmsg, sent);
+                    return;
+                }
+            }
+        }
+    } while ( check++ < 100 &&
+            (rc >= 0 || errno == EAGAIN || errno == EWOULDBLOCK) );
+    /* keep consuming messages, or check for messages up to 100 times max */
+
+    if ( sent ) {
+        Log(LOG_DEBUG,
+                "Failed to get transmit timestamp for packet, using estimate");
     }
 }
+#endif
 
 
 
@@ -416,8 +561,23 @@ int get_packet(struct socket_t *sockets, char *buf, int buflen,
 int delay_send_packet(int sock, char *packet, int size, struct addrinfo *dest,
         uint32_t inter_packet_delay, struct timeval *sent) {
 
-    int bytes_sent;
     static struct timeval last = {0, 0};
+#ifdef HAVE_SOF_TIMESTAMPING_OPT_ID
+    /*
+     * This could be associated more closely with each individual socket, but
+     * for now lets store the id of the packets we send here so that calling
+     * functions don't need to do any extra work. We make the assumption that
+     * tests will generally use file descriptors with lower numbers, so we can
+     * use a small array indexed by file descriptor to store the packet count
+     * for the values of descriptor that we expect to see, which are then used
+     * to match the correct timestamp message. We also make the assumption that
+     * the same file descriptor always refers to the same socket, and they
+     * aren't being reused.
+     * TODO attach packet count information to the socket and pass it around.
+     */
+    static uint32_t packet_id[MAX_TX_TIMESTAMP_FD] = {0};
+#endif
+    int bytes_sent;
     struct timeval now;
     int delay, diff;
 
@@ -435,13 +595,13 @@ int delay_send_packet(int sock, char *packet, int size, struct addrinfo *dest,
 
     /* determine how much time is left to wait until the minimum delay */
     if ( last.tv_sec != 0 && diff < (int)inter_packet_delay ) {
-	delay = inter_packet_delay - diff;
+        delay = inter_packet_delay - diff;
     } else {
-	delay = 0;
-	last.tv_sec = now.tv_sec;
-	last.tv_usec = now.tv_usec;
+        delay = 0;
+        last.tv_sec = now.tv_sec;
+        last.tv_usec = now.tv_usec;
 
-        /* populate sent timestamp as well, if not null */
+        /* populate sent timestamp (might get overwritten by a better one) */
         if ( sent ) {
             sent->tv_sec = now.tv_sec;
             sent->tv_usec = now.tv_usec;
@@ -453,10 +613,21 @@ int delay_send_packet(int sock, char *packet, int size, struct addrinfo *dest,
      * control to the caller, in case they want to do more work while waiting
      */
     if ( delay != 0 ) {
-	return delay;
+        return delay;
     }
 
     bytes_sent = sendto(sock, packet, size, 0, dest->ai_addr, dest->ai_addrlen);
+
+#ifdef HAVE_SOF_TIMESTAMPING_OPT_ID
+    /* get timestamp if TIMESTAMPING is available and we know the packet id */
+    if ( sock < MAX_TX_TIMESTAMP_FD ) {
+        get_tx_timestamping(sock, packet_id[sock]++, sent);
+    } else {
+        Log(LOG_WARNING,
+                "Transmit timestamps only supported for file descriptors < %d",
+                MAX_TX_TIMESTAMP_FD);
+    }
+#endif
 
     /* TODO determine error and/or send any unsent bytes */
     if ( bytes_sent != size ) {
@@ -488,7 +659,7 @@ char *address_to_name(struct addrinfo *address) {
  * address b, respectively.
  */
 int compare_addresses(const struct sockaddr *a,
-        const struct sockaddr *b, int len) {
+        const struct sockaddr *b, uint8_t len) {
     if ( a == NULL || b == NULL ) {
         return -1;
     }
@@ -505,43 +676,49 @@ int compare_addresses(const struct sockaddr *a,
     if ( a->sa_family == AF_INET ) {
         struct sockaddr_in *a4 = (struct sockaddr_in*)a;
         struct sockaddr_in *b4 = (struct sockaddr_in*)b;
-        if ( len > 0 && len <= 32 ) {
+
+        if ( len > 0 && len < 32 ) {
             uint32_t mask = ntohl(0xffffffff << (32 - len));
+            assert(mask > 0);
             if ( (a4->sin_addr.s_addr & mask) ==
                     (b4->sin_addr.s_addr & mask) ) {
                 return 0;
             }
+
             return ((a4->sin_addr.s_addr & mask) >
                     (b4->sin_addr.s_addr & mask)) ? 1 : -1;
         }
+
         return memcmp(&a4->sin_addr, &b4->sin_addr, sizeof(struct in_addr));
     }
 
     if ( a->sa_family == AF_INET6 ) {
         struct sockaddr_in6 *a6 = (struct sockaddr_in6*)a;
         struct sockaddr_in6 *b6 = (struct sockaddr_in6*)b;
-        if ( len > 0 && len <= 128 ) {
-            uint32_t mask[4];
-            int i;
-            for ( i = 0; i < 4; i++ ) {
-                if ( len >= ((i + 1) * 32) ) {
-                    mask[i] = 0xffffffff;
-                } else if ( len < ((i + 1) * 32) && len > (i * 32) ) {
-                    mask[i] = ntohl(0xffffffff << (((i + 1) * 32) - len));
-                } else {
-                    mask[i] = 0;
+
+        if ( len > 0 && len < 128 ) {
+            uint16_t mask = 0xffff;
+            uint8_t i;
+
+            /*
+             * masks must be contiguous, so only the last field checked will
+             * have any unset bits
+             */
+            for ( i = 0; i < 8 && mask == 0xffff; i++ ) {
+                if ( len < ((i + 1) * 16) ) {
+                    mask = ntohs(0xffff << (((i + 1) * 16) - len));
+                }
+
+                if ( (a6->sin6_addr.s6_addr16[i] & mask) !=
+                        (b6->sin6_addr.s6_addr16[i] & mask) ) {
+                    return ((a6->sin6_addr.s6_addr16[i] & mask) >
+                            (b6->sin6_addr.s6_addr16[i] & mask)) ? 1 : -1;
                 }
             }
 
-            for ( i = 0; i < 4; i++ ) {
-                if ( (a6->sin6_addr.s6_addr32[i] & mask[i]) !=
-                        (b6->sin6_addr.s6_addr32[i] & mask[i]) ) {
-                    return ((a6->sin6_addr.s6_addr32[i] & mask[i]) >
-                            (b6->sin6_addr.s6_addr32[i] & mask[i])) ? 1 : -1;
-                }
-            }
             return 0;
         }
+
         return memcmp(&a6->sin6_addr, &b6->sin6_addr, sizeof(struct in6_addr));
     }
 
@@ -582,12 +759,17 @@ int bind_socket_to_device(int sock, char *device) {
 
     Log(LOG_DEBUG, "Trying to bind socket to device '%s'", device);
 
+#ifdef SO_BINDTODEVICE
     if ( setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE, device,
                 strlen(device)+1) < 0 ) {
         Log(LOG_WARNING, "Failed to bind to device %s: %s", device,
                 strerror(errno));
         return -1;
     }
+#else
+    Log(LOG_WARNING, "Failed to bind to device %s: SO_BINDTODEVICE undefined",
+            device);
+#endif
 
     return 0;
 }
@@ -698,15 +880,44 @@ int bind_sockets_to_address(struct socket_t *sockets,
  */
 static void set_timestamp_socket_option(int sock) {
     assert(sock >= 0);
-#ifdef SO_TIMESTAMP
-    int one = 1;
-    /* try to enable socket timestamping using SO_TIMESTAMP */
-    if ( setsockopt(sock, SOL_SOCKET, SO_TIMESTAMP, &one, sizeof(one)) < 0 ) {
-        Log(LOG_DEBUG, "No SO_TIMESTAMP support, using SIOCGSTAMP");
+
+/* SOF_TIMESTAMPING_OPT_ID is required to match packets with timestamps */
+#ifdef HAVE_SOF_TIMESTAMPING_OPT_ID
+    {
+        int optval = SOF_TIMESTAMPING_OPT_ID |
+            SOF_TIMESTAMPING_OPT_TSONLY |
+            SOF_TIMESTAMPING_RX_SOFTWARE |
+            SOF_TIMESTAMPING_TX_SOFTWARE |
+            SOF_TIMESTAMPING_SOFTWARE;
+
+        /*
+         * TODO being able to set SOF_TIMESTAMPING_TX_SOFTWARE is no guarantee
+         * that network interfaces will actually support it. Is there any way
+         * we can actually check for support - use ETHTOOL_GET_TS_INFO?
+         */
+        if ( setsockopt(sock, SOL_SOCKET, SO_TIMESTAMPING, &optval,
+                    sizeof(optval)) >= 0 ) {
+            Log(LOG_DEBUG, "Using SOF_TIMESTAMPING_SOFTWARE");
+            return;
+        }
     }
-#else
-    Log(LOG_DEBUG, "No SO_TIMESTAMP support, using SIOCGSTAMP");
 #endif
+
+    Log(LOG_DEBUG, "No SO_TIMESTAMPING support, trying SO_TIMESTAMP");
+
+#ifdef SO_TIMESTAMP
+    {
+        int one = 1;
+        /* try to enable socket timestamping using SO_TIMESTAMP */
+        if ( setsockopt(sock, SOL_SOCKET, SO_TIMESTAMP, &one,
+                    sizeof(one)) >= 0 ) {
+            Log(LOG_DEBUG, "Using SO_TIMESTAMP");
+            return;
+        }
+    }
+#endif
+
+    Log(LOG_DEBUG, "No SO_TIMESTAMP support, using SIOCGSTAMP");
 }
 
 
@@ -766,9 +977,19 @@ int set_dscp_socket_options(struct socket_t *sockets, uint8_t dscp) {
     if ( sockets->socket6 > 0 ) {
         if ( setsockopt(sockets->socket6, IPPROTO_IPV6, IPV6_TCLASS, &value,
                     sizeof(value)) < 0 ) {
+            int tmperrno = errno;
             Log(LOG_WARNING, "Failed to set IPv6 DSCP to %d: %s", value,
-                    strerror(errno));
-            return -1;
+                    strerror(tmperrno));
+            /*
+             * Workaround failing unit tests on qemu/docker-based build
+             * environments - IPV6_TCLASS isn't implemented in qemu until
+             * v4.1.0, lack of which causes this setsockopt to fail with
+             * ENOPROTOOPT when running on non-amd64 dockers. Fixed by
+             * https://github.com/qemu/qemu/commit/b9cce6d756043c92de1c29f73f
+             */
+            if ( tmperrno != ENOPROTOOPT ) {
+                return -1;
+            }
         }
     }
 
@@ -795,13 +1016,20 @@ int check_exists(char *path, int strict) {
 
     /* file exists */
     if ( stat_result == 0 ) {
-        /* check it's a normal file or a symbolic link */
-        if ( S_ISREG(statbuf.st_mode) || S_ISLNK(statbuf.st_mode) ) {
+        /* check it's a normal file with contents or a symbolic link */
+        if ( (S_ISREG(statbuf.st_mode) && statbuf.st_size > 0)
+#ifdef S_ISLNK
+                || S_ISLNK(statbuf.st_mode)
+#endif
+           ) {
             return 0;
         }
 
-        Log(LOG_WARNING, "File %s exists, but is not a regular file", path);
-        return -1;
+        /* non-normal files are errors, empty normal files count as missing */
+        if ( !S_ISREG(statbuf.st_mode) ) {
+            Log(LOG_WARNING, "File %s exists, but is not a regular file", path);
+            return -1;
+        }
     }
 
     /* file was manually specified, but doesn't exist, that's an error */
@@ -825,7 +1053,7 @@ int copy_address_to_protobuf(ProtobufCBinaryData *dst,
         const struct addrinfo *src) {
     assert(dst);
 
-    if ( src == NULL ) {
+    if ( src == NULL || src->ai_addr == NULL ) {
         dst->data = 0;
         dst->len = 0;
         return 0;

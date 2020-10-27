@@ -57,6 +57,7 @@
 #include <sys/ioctl.h>
 #include <math.h>
 #include <inttypes.h>
+#include <pcap.h>
 
 #include "config.h"
 #include "tests.h"
@@ -69,6 +70,12 @@
 #include "checksum.h"
 
 
+/* time till next packet after which select will sleep rather than spin */
+const struct timeval THRESHOLD = {0, 1000};
+/* percentile values of interest */
+const float PERCENTILES[] = {0.0, 0.1, 1.0, 5.0, 10.0, 20.0, 30.0, 40.0, 50.0,
+    60.0, 70.0, 80.0, 90.0, 95.0, 99.0, 99.9, 100};
+#define PERCENTILE_COUNT ((int)(sizeof(PERCENTILES) / sizeof(float)))
 
 static struct option long_options[] = {
     {"count", required_argument, 0, 'c'},
@@ -185,6 +192,10 @@ static Amplet2__Fastping__Item* report_destination(struct info_t *timing,
 
     amplet2__fastping__item__init(item);
 
+    if ( timing == NULL ) {
+        return item;
+    }
+
     memset(&rtt, 0, sizeof(rtt));
     memset(&jitter, 0, sizeof(jitter));
 
@@ -225,22 +236,22 @@ static Amplet2__Fastping__Item* report_destination(struct info_t *timing,
         qsort(ipv, rtt.samples, sizeof(int32_t), cmp);
         rtt.maximum = ipv[rtt.samples - 1];
         rtt.minimum = ipv[0];
+        rtt.sd = sqrt(rtt_squares / rtt.samples);
+        item->rtt = report_summary(&rtt, ipv);
     }
 
     if ( jitter.samples > 0 ) {
         qsort(ipdv, jitter.samples, sizeof(int32_t), cmp);
         jitter.maximum = ipdv[jitter.samples - 1];
         jitter.minimum = ipdv[0];
+        jitter.sd = sqrt(jitter_squares / jitter.samples);
+        item->jitter = report_summary(&jitter, ipdv);
     }
 
-    rtt.sd = sqrt(rtt_squares / rtt.samples);
-    jitter.sd = sqrt(jitter_squares / jitter.samples);
-
-    item->rtt = report_summary(&rtt, ipv);
-    item->jitter = report_summary(&jitter, ipdv);
-
-    item->has_runtime = 1;
-    item->runtime = runtime->tv_sec * 1000000 + runtime->tv_usec;
+    if ( runtime ) {
+        item->has_runtime = 1;
+        item->runtime = runtime->tv_sec * 1000000 + runtime->tv_usec;
+    }
 
     free(ipv);
     free(ipdv);
@@ -295,8 +306,20 @@ static amp_test_result_t* report_result(struct timeval *start_time,
     amplet2__fastping__report__pack(&msg, result->data);
 
     /* free all data that is no longer required by the protobuffer */
-    free(reports[0]->rtt);
-    free(reports[0]->jitter);
+    if ( reports[0]->rtt ) {
+        if ( reports[0]->rtt->percentiles ) {
+            free(reports[0]->rtt->percentiles);
+        }
+        free(reports[0]->rtt);
+    }
+
+    if ( reports[0]->jitter ) {
+        if ( reports[0]->jitter->percentiles ) {
+            free(reports[0]->jitter->percentiles);
+        }
+        free(reports[0]->jitter);
+    }
+
     free(reports[0]);
     free(reports);
 
@@ -375,6 +398,64 @@ static int configure_socket(struct socket_t *sockets, struct opt_t *options,
 
 
 /*
+ * Restrict the socket to only receiving ICMP ECHO REPLY packets that have
+ * the correct ID field set. Anything else will be discarded before we see it.
+ */
+static int set_socket_filter(int sock, int family, int ident) {
+    pcap_t *pcap;
+    struct bpf_program bpf;
+    char filterstring[1024];
+
+    switch ( family ) {
+        case AF_INET:
+            snprintf(filterstring, 1023,
+                    "icmp and icmp[icmptype] == icmp-echoreply and "
+                    "icmp[4:2] = 0x%x", ident);
+            break;
+        case AF_INET6:
+            /*
+             * raw ipv6 sockets strip the ipv6 header so the data we get
+             * starts at the icmp header. Pretend it's the ethernet header
+             * and so we can use pcap_compile to create the bpf filter.
+             * Alternatively, we could do the same thing iputils ping does
+             * and write bpf to directly examine the bytes of interest.
+             */
+            snprintf(filterstring, 1023,
+                    "ether[0] = 0x81 and ether[4:2] = 0x%x", ident);
+            break;
+        default: return -1;
+    };
+
+    Log(LOG_DEBUG, "Filterstring: %s", filterstring);
+
+    if ( (pcap = pcap_open_dead(DLT_RAW, 64)) == NULL ) {
+        Log(LOG_ERR, "Failed to get pcap handle");
+        return -1;
+    }
+
+    if ( pcap_compile(pcap, &bpf, filterstring, 1, PCAP_NETMASK_UNKNOWN) < 0 ) {
+        Log(LOG_ERR, "Failed to compile BPF filter: %s", pcap_geterr(pcap));
+        pcap_close(pcap);
+        return -1;
+    }
+
+    pcap_close(pcap);
+
+    if ( setsockopt(sock, SOL_SOCKET, SO_ATTACH_FILTER, &bpf,
+                sizeof(bpf)) < 0 ) {
+        Log(LOG_ERR, "Failed to attach BPF filter");
+        pcap_freecode(&bpf);
+        return -1;
+    }
+
+    pcap_freecode(&bpf);
+
+    return 0;
+}
+
+
+
+/*
  * Create the packet and fill in the required fields. The ICMP header only
  * has 16 bits for sequence numbers, so include a 64 bit field to track
  * the actual value for use once the sequence wraps. The two fields are
@@ -397,7 +478,7 @@ static int build_packet(uint8_t family, void *packet, uint16_t size,
     icmp->code = 0;
     icmp->checksum = 0;
     icmp->un.echo.id = htons(ident);
-    icmp->un.echo.sequence = ntohs(seq);
+    icmp->un.echo.sequence = htons(seq);
     memcpy((uint8_t *)packet + sizeof(struct icmphdr), &magic, sizeof(magic));
 
     if ( family == AF_INET ) {
@@ -417,46 +498,78 @@ static int build_packet(uint8_t family, void *packet, uint16_t size,
  * Determine if the packet is a response to one we've sent, and if so extract
  * the full length sequence number from it.
  */
-static int64_t extract_data(struct addrinfo *dest, char *packet,
+static int64_t extract_data(struct addrinfo *dest, char *packet, size_t length,
         uint16_t ident, struct sockaddr *from) {
 
     int64_t magic = 0;
     uint16_t sequence = 0;
     size_t sockaddrlen;
+    uint8_t offset;
 
-    ident = ntohs(ident);
+    ident = htons(ident);
 
     if ( dest->ai_family == AF_INET ) {
-        struct iphdr* ip = (struct iphdr*) packet;
-        struct icmphdr *icmp = (struct icmphdr*)(packet + (ip->ihl * 4));
+        struct iphdr* ip;
+        struct icmphdr *icmp;
 
-        if ( icmp->type != ICMP_ECHOREPLY || icmp->un.echo.id != ident ) {
+        if ( length < MINIMUM_FASTPING_PACKET_SIZE ) {
+            Log(LOG_DEBUG, "Ignoring too-short response packet");
+            return -1;
+        }
+
+        ip = (struct iphdr*) packet;
+        icmp = (struct icmphdr*)(packet + (ip->ihl * 4));
+
+        if ( icmp->type != ICMP_ECHOREPLY ) {
+            Log(LOG_DEBUG, "Ignoring incorrect icmp type");
+            return -1;
+        }
+
+        if ( icmp->un.echo.id != ident ) {
+            Log(LOG_DEBUG, "Ignoring incorrect icmp id");
             return -1;
         }
 
         sequence = icmp->un.echo.sequence;
         sockaddrlen = sizeof(struct sockaddr_in);
+        offset = sizeof(struct iphdr) + sizeof(struct icmphdr);
     } else {
-        struct icmp6_hdr *icmp = (struct icmp6_hdr*)packet;
+        struct icmp6_hdr *icmp;
 
-        if ( icmp->icmp6_type != ICMP6_ECHO_REPLY || icmp->icmp6_id != ident ) {
+        if ( length < (sizeof(struct icmp6_hdr) + sizeof(uint64_t)) ) {
+            Log(LOG_DEBUG, "Ignoring too-short response packet");
+            return -1;
+        }
+
+        icmp = (struct icmp6_hdr*)packet;
+
+        if ( icmp->icmp6_type != ICMP6_ECHO_REPLY ) {
+            Log(LOG_DEBUG, "Ignoring incorrect icmp type");
+            return -1;
+        }
+
+        if ( icmp->icmp6_id != ident ) {
+            Log(LOG_DEBUG, "Ignoring incorrect icmp id");
             return -1;
         }
 
         sequence = icmp->icmp6_seq;
         sockaddrlen = sizeof(struct sockaddr_in6);
+        offset = sizeof(struct icmphdr);
     }
 
     /* doesn't hurt to check that the address matches what we expect */
     if ( memcmp(dest->ai_addr, from, sockaddrlen) != 0 ) {
+        Log(LOG_DEBUG, "Ignoring response from incorrect address");
         return -1;
     }
 
     /* extract the full 64 bit sequence value from the packet payload */
-    magic = *(int64_t*)(((char *)packet) + sizeof(struct icmphdr));
+    magic = *(int64_t*)(((char *)packet) + offset);
 
     /* the last 16 bits should match the ICMP sequence number */
     if ( ( (uint16_t) magic) != ntohs(sequence)) {
+        Log(LOG_DEBUG, "Ignoring response with incorrect sequence number");
         return -1;
     }
 
@@ -467,7 +580,7 @@ static int64_t extract_data(struct addrinfo *dest, char *packet,
 
 /*
  * Build, send and receive the packets for the test. Rather than using
- * libwandevent we instead loop tightly around select() with a zero timeout
+ * libevent we instead loop tightly around select() with a zero timeout
  * to try to minimise delay between when a packet should be sent, and when it
  * is sent.
  */
@@ -497,14 +610,30 @@ static amp_test_result_t* send_icmp_stream(struct addrinfo *dest,
     memset(&stop_time, 0, sizeof(struct timeval));
     memset(&loss_timeout, 0, sizeof(struct timeval));
 
+    /* get the current time to use when reporting initial errors */
+    if ( gettimeofday(&start_time, NULL) != 0 ) {
+        Log(LOG_ERR, "Could not gettimeofday(), aborting test");
+        exit(EXIT_FAILURE);
+    }
+
+    if ( dest->ai_addr == NULL ) {
+        return report_result(&start_time, dest, options, NULL, NULL);
+    }
+
+    Log(LOG_DEBUG, "amp-fastping pid/ident = %d (0x%x)", pid, pid);
+
     /* extract the socket depending on the address family */
     switch ( dest->ai_family ) {
         case AF_INET: sock = sockets->socket; break;
         case AF_INET6: sock = sockets->socket6; break;
         default:
            Log(LOG_ERR,"Unknown address family %d", dest->ai_family);
-           return NULL;
+           return report_result(&start_time, dest, options, NULL, NULL);
     };
+
+    if ( set_socket_filter(sock, dest->ai_family, pid) < 0 ) {
+        return report_result(&start_time, dest, options, NULL, NULL);
+    }
 
     /* packet rate is an integer above zero, so longest gap is only 1 second */
     interpacket_gap.tv_sec = options->rate <= 1 ? 1 : 0;
@@ -532,6 +661,7 @@ static amp_test_result_t* send_icmp_stream(struct addrinfo *dest,
     /* generate the first packet of the run before we are ready to send it */
     length = build_packet(dest->ai_family, packet, options->size, 0, pid, 0);
 
+    /* set the actual start time now after doing all the setup */
     if ( gettimeofday(&start_time, NULL) != 0 ) {
 	Log(LOG_ERR, "Could not gettimeofday(), aborting test");
 	exit(EXIT_FAILURE);
@@ -540,14 +670,25 @@ static amp_test_result_t* send_icmp_stream(struct addrinfo *dest,
     timeradd(&start_time, &interpacket_gap, &next_packet);
 
     while ( sent < options->count || received < options->count ) {
-        struct timeval timeout;
+        struct timeval timeout = {0, 0};
         struct timeval now;
         fd_set readfds, writefds;
 
         if ( sent < options->count ) {
-            /* don't let select sleep while we have packets still to send */
-            timeout.tv_sec = 0;
-            timeout.tv_usec = 0;
+            struct timeval towait;
+            /*
+             * Still sending data, but it seems wasteful to spin on this loop
+             * if we know there is a long time to wait till the next packet.
+             * Sleep for some portion of the time till the next packet if it
+             * is further away than the threshold. Don't sleep too long or
+             * we won't send the next packet on time, or we won't service this
+             * loop often enough and incoming packets could fill up buffers.
+             */
+            gettimeofday(&now, NULL);
+            timersub(&next_packet, &now, &towait);
+            if ( timercmp(&towait, &THRESHOLD, >) ) {
+                usleep(towait.tv_usec * 0.30);
+            }
         } else {
             /* otherwise we'll wait for a bit after the last packet we saw */
             timeout.tv_sec = FASTPING_PACKET_LOSS_TIMEOUT;
@@ -612,21 +753,36 @@ static amp_test_result_t* send_icmp_stream(struct addrinfo *dest,
             int bytes;
             struct timeval receive_time;
 
-            /* read one packet out of the buffer for processing */
+            /*
+             * Only one packet is read here to try to limit any delay to
+             * sending the next packet. If lots of packets arrive all at
+             * once then they won't get processed quickly, which could fill
+             * buffers. Filtering as many unwanted packets as possible helps,
+             * as does making sure we hit this loop regularly.
+             */
             bytes = get_packet(sockets, response, RESPONSE_BUFFER_LEN, &from,
                     &wait, &receive_time);
 
             if ( bytes > 0 ) {
                 /* extract the sequence number from the icmp packet */
-                int64_t sequence = extract_data(dest, response, pid, &from);
-                if ( sequence >= 0 && sequence < options->count) {
-                    memcpy(&(timing[sequence].time_received),
-                            &receive_time, sizeof(struct timeval));
-                    received++;
-                    if ( received >= options->count ) {
-                        Log(LOG_DEBUG, "Received all responses");
-                        break;
+                int64_t sequence;
+                sequence = extract_data(dest, response, bytes, pid, &from);
+                if ( sequence >= 0 && sequence < (int64_t)sent ) {
+                    if ( !timerisset(&timing[sequence].time_received) ) {
+                        memcpy(&(timing[sequence].time_received),
+                                &receive_time, sizeof(struct timeval));
+                        received++;
+                        if ( received >= options->count ) {
+                            Log(LOG_DEBUG, "Received all responses");
+                            break;
+                        }
+                    } else {
+                        Log(LOG_DEBUG, "Ignoring duplicate sequence number %d",
+                                sequence);
                     }
+                } else {
+                    Log(LOG_DEBUG, "Ignoring out of range sequence number %d",
+                            sequence);
                 }
             }
         }
@@ -783,6 +939,7 @@ void print_fastping(amp_test_result_t *result) {
     Amplet2__Fastping__Header *header;
 
     char addrstr[INET6_ADDRSTRLEN];
+    uint64_t samples;
     double percent;
     double pps;
 
@@ -800,8 +957,16 @@ void print_fastping(amp_test_result_t *result) {
     item = msg->reports[0];
     header = msg->header;
 
-    percent = ((double) item->rtt->samples / (double) header->count) * 100;
-    inet_ntop(header->family, header->address.data, addrstr, INET6_ADDRSTRLEN);
+    samples = item->rtt ? item->rtt->samples : 0;
+    percent = ((double) samples / (double) header->count) * 100;
+
+    if ( header->has_address ) {
+        inet_ntop(header->family, header->address.data, addrstr,
+                INET6_ADDRSTRLEN);
+    } else {
+        snprintf(addrstr, INET6_ADDRSTRLEN, "unresolved %s",
+                family_to_string(header->family));
+    }
 
     /* print basic stats */
     printf("\n");
@@ -811,19 +976,31 @@ void print_fastping(amp_test_result_t *result) {
             header->count, header->size, header->rate, header->preprobe,
             dscp_to_str(header->dscp), header->dscp);
 
+    /* if the test didn't run then there isn't much to print */
+    if ( samples == 0 && item->runtime == 0 ) {
+        printf("  0 packets transmitted, 0 received\n");
+        return;
+    }
+
     printf("  %" PRIu64 " packets transmitted, %" PRIu64
             " received, %.02f%% packet loss\n",
-            header->count, item->rtt->samples, 100 - percent);
-    printf("  %" PRIu64 " rtt samples min/mean/max/sdev = "
-            "%.03f/%.03f/%.03f/%.03f ms\n",
-            item->rtt->samples, item->rtt->minimum / 1000.0,
-            item->rtt->mean / 1000.0, item->rtt->maximum / 1000.0,
-            item->rtt->sd / 1000.0);
-    printf("  %" PRIu64 " jitter samples min/mean/max/sdev = "
-            "%.03f/%.03f/%.03f/%.03f ms\n",
-            item->jitter->samples, item->jitter->minimum / 1000.0,
-            item->jitter->mean / 1000.0, item->jitter->maximum / 1000.0,
-            item->jitter->sd / 1000.0);
+            header->count, samples, 100 - percent);
+
+    if ( item->rtt ) {
+        printf("  %" PRIu64 " rtt samples min/mean/max/sdev = "
+                "%.03f/%.03f/%.03f/%.03f ms\n",
+                item->rtt->samples, item->rtt->minimum / 1000.0,
+                item->rtt->mean / 1000.0, item->rtt->maximum / 1000.0,
+                item->rtt->sd / 1000.0);
+    }
+
+    if ( item->jitter ) {
+        printf("  %" PRIu64 " jitter samples min/mean/max/sdev = "
+                "%.03f/%.03f/%.03f/%.03f ms\n",
+                item->jitter->samples, item->jitter->minimum / 1000.0,
+                item->jitter->mean / 1000.0, item->jitter->maximum / 1000.0,
+                item->jitter->sd / 1000.0);
+    }
 
     pps = header->count / (item->runtime/1000000.0);
     printf("  Test ran for %.03lf seconds at %.03f packets per second ",
@@ -831,7 +1008,8 @@ void print_fastping(amp_test_result_t *result) {
 
     print_datarate(pps, header->size);
 
-    if ( item->rtt->percentiles && item->jitter->percentiles ) {
+    if ( item->rtt && item->rtt->percentiles &&
+            item->jitter && item->jitter->percentiles ) {
         print_percentiles(item->rtt->percentiles, item->jitter->percentiles);
     }
 

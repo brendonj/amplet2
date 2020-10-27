@@ -41,7 +41,8 @@
 #define _MEASURED_NAMETABLE_H
 
 #include <stdint.h>
-#include <libwandevent.h>
+#include <event2/event.h>
+#include <unbound.h>
 
 #define MAX_NAMETABLE_LINE 128
 #define NAMETABLE_DIR AMP_CONFIG_DIR "/nametables"
@@ -56,8 +57,8 @@ struct nametable_item {
 };
 typedef struct nametable_item nametable_t;
 
-void read_nametable_dir(char *directory);
-void setup_nametable_refresh(wand_event_handler_t *ev_hdl);
+void read_nametable_dir(struct ub_ctx *ctx, char *directory);
+void setup_nametable_refresh(struct event_base *base);
 nametable_t *name_to_address(char *name);
 void clear_nametable(void);
 #if UNIT_TEST

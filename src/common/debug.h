@@ -52,6 +52,7 @@ extern int log_level_override;
 
 void Log(int priority, const char *fmt, ...);
 const char *amp_inet_ntop(struct addrinfo *addr, char *buffer);
+const char *family_to_string(int family);
 
 #ifdef __cplusplus
 }

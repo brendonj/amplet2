@@ -66,7 +66,6 @@ static void *amp_resolver_worker_thread(void *thread_data) {
     uint8_t namelen;
     int bytes;
     pthread_mutex_t addrlist_lock;
-    int remaining = 0;
 
     Log(LOG_DEBUG, "Starting new name resolution thread");
 
@@ -95,13 +94,13 @@ static void *amp_resolver_worker_thread(void *thread_data) {
 
         /* add it to the list of names to resolve and go back for more */
         amp_resolve_add(data->ctx, &addrlist, &addrlist_lock, name,
-                info.family, info.count, &remaining);
+                info.family, info.count);
     }
 
     Log(LOG_DEBUG, "Got all requests, waiting for responses");
 
     /* when the remote end has finished sending names, wait for resolution */
-    amp_resolve_wait(data->ctx, &addrlist_lock, &remaining);
+    ub_wait(data->ctx);
 
     /* once we have all the responses then we don't need the addrlist lock */
     pthread_mutex_lock(&addrlist_lock);
@@ -116,10 +115,14 @@ static void *amp_resolver_worker_thread(void *thread_data) {
             goto end;
         }
 
-        if ( send(data->fd, item->ai_addr,item->ai_addrlen,MSG_NOSIGNAL) < 0 ) {
-            Log(LOG_WARNING, "Failed to send resolved address: %s",
-                    strerror(errno));
-            goto end;
+        /* there might not be an address for this name */
+        if ( item->ai_addrlen > 0 ) {
+            if ( send(data->fd, item->ai_addr, item->ai_addrlen,
+                        MSG_NOSIGNAL) < 0 ) {
+                Log(LOG_WARNING, "Failed to send resolved address: %s",
+                        strerror(errno));
+                goto end;
+            }
         }
 
         namelen = strlen(item->ai_canonname) + 1;
@@ -172,9 +175,8 @@ void amp_resolver_context_delete(struct ub_ctx *ctx) {
  * Accept a new connection on the local name resolution socket and spawn
  * a new thread to deal with the queries from the test process.
  */
-void resolver_socket_event_callback(
-        __attribute__((unused))wand_event_handler_t *ev_hdl, int eventfd,
-        void *data, __attribute__((unused))enum wand_eventtype_t ev) {
+void resolver_socket_event_callback(evutil_socket_t evsock,
+    __attribute__((unused))short flags, void *evdata) {
 
     int fd;
     pthread_t thread;
@@ -182,7 +184,7 @@ void resolver_socket_event_callback(
 
     Log(LOG_DEBUG, "Accepting for new resolver connection");
 
-    if ( (fd = accept(eventfd, NULL, NULL)) < 0 ) {
+    if ( (fd = accept(evsock, NULL, NULL)) < 0 ) {
         Log(LOG_WARNING, "Failed to accept for name resolution: %s",
                 strerror(errno));
         return;
@@ -191,7 +193,7 @@ void resolver_socket_event_callback(
     Log(LOG_DEBUG, "Accepted new resolver connection on fd %d", fd);
 
     info = calloc(1, sizeof(struct amp_resolve_info));
-    info->ctx = data;
+    info->ctx = evdata;
     info->fd = fd;
 
     /* create the thread and detach, we don't need to look after it */

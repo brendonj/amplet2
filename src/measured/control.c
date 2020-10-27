@@ -51,7 +51,7 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <arpa/inet.h>
-#include <libwandevent.h>
+#include <event2/event.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <stdint.h>
@@ -76,7 +76,7 @@
  * XXX these names are all very confusing when compared to the protobuf
  * names in common/servers.proto and the associated functions!
  */
-static int parse_server_start(void *data, uint32_t len, uint64_t *type) {
+static int parse_server_start(void *data, uint32_t len, uint64_t *type, char ***params) {
 
     Amplet2__Measured__Control *msg;
 
@@ -99,8 +99,7 @@ static int parse_server_start(void *data, uint32_t len, uint64_t *type) {
     }
 
     *type = msg->server->test_type;
-
-    /* TODO argv */
+    *params = parse_param_string(msg->server->params);
 
     amplet2__measured__control__free_unpacked(msg, NULL);
 
@@ -182,6 +181,7 @@ static int parse_single_test(void *data, uint32_t len,
 static void do_start_server(BIO *ctrl, void *data, uint32_t len) {
     timer_t watchdog;
     uint64_t test_type;
+    char **test_params;
     test_t *test;
     char *proc_name;
     struct sockaddr_storage addr;
@@ -194,7 +194,7 @@ static void do_start_server(BIO *ctrl, void *data, uint32_t len) {
     int fd;
 
     /* TODO read test arguments if required */
-    if ( parse_server_start(data, len, &test_type) < 0 ) {
+    if ( parse_server_start(data, len, &test_type, &test_params) < 0 ) {
         Log(LOG_WARNING, "Failed to parse SERVER packet");
         return;
     }
@@ -238,6 +238,7 @@ static void do_start_server(BIO *ctrl, void *data, uint32_t len) {
         return;
     }
 
+#ifdef SO_BINDTODEVICE
     /* bind to the same device as the connected control socket */
     optlen = sizeof(opt);
     /* linux >= 3.8 required to get SO_BINDTODEVICE */
@@ -248,6 +249,7 @@ static void do_start_server(BIO *ctrl, void *data, uint32_t len) {
             argv[argc++] = opt;
         }
     }
+#endif
 
     /* bind to the same address as the connected control socket */
     addrlen = sizeof(struct sockaddr_storage);
@@ -270,6 +272,23 @@ static void do_start_server(BIO *ctrl, void *data, uint32_t len) {
         }
     }
 
+    /* add any arguments that came from the remote end */
+    if ( test_params ) {
+        int i;
+        for ( i = 0; test_params[i] != NULL; i++ ) {
+            argv[argc++] = test_params[i];
+        }
+    }
+
+    /* TODO overwrite duplicates rather than appending? */
+    /* add any default arguments from the client config file */
+    if ( test->server_params ) {
+        int i;
+        for ( i = 0; test->server_params[i] != NULL; i++ ) {
+            argv[argc++] = test->server_params[i];
+        }
+    }
+
     argv[argc] = NULL;
 
     /* Run server function using callback in test */
@@ -279,6 +298,14 @@ static void do_start_server(BIO *ctrl, void *data, uint32_t len) {
 
     free_duped_environ();
     free(proc_name);
+
+    if ( test_params ) {
+        int i;
+        for ( i = 0; test_params[i] != NULL; i++ ) {
+            free(test_params[i]);
+        }
+        free(test_params);
+    }
 }
 
 
@@ -414,16 +441,19 @@ static void process_control_message(int fd, struct acl_root *acl) {
  * Short callback to fork a new process for dealing with the control message.
  * TODO this is very very similar to test.c:fork_test()
  */
-static void control_read_callback(wand_event_handler_t *ev_hdl, int fd,
-        void *data, __attribute__((unused))enum wand_eventtype_t ev) {
+static void control_read_callback(evutil_socket_t evsock,
+        __attribute__((unused))short flags, void *evdata) {
 
     pid_t pid;
+    struct acl_event *acl_e = evdata;
+    struct acl_root *acl = acl_e->acl;
 
     /*
      * The main event loop shouldn't trigger on these events any more, once
      * we read data from here it is someone elses problem.
      */
-    wand_del_fd(ev_hdl, fd);
+    event_free(acl_e->control_read);
+    free(acl_e);
 
     /* Fork to validate SSL cert and actually run the server */
     if ( (pid = fork()) < 0 ) {
@@ -446,12 +476,12 @@ static void control_read_callback(wand_event_handler_t *ev_hdl, int fd,
         }
 
         reseed_openssl_rng();
-        process_control_message(fd, (struct acl_root*)data);
+        process_control_message(evsock, acl);
         exit(EXIT_SUCCESS);
     }
 
     /* the parent process doesn't need the client file descriptor */
-    close(fd);
+    close(evsock);
 }
 
 
@@ -460,23 +490,31 @@ static void control_read_callback(wand_event_handler_t *ev_hdl, int fd,
  * A connection has been made on our control port. Accept it and set up an
  * event for when data arrives on this connection.
  */
-static void control_establish_callback(wand_event_handler_t *ev_hdl,
-        int eventfd, void *data,
-        __attribute__((unused))enum wand_eventtype_t ev) {
+static void control_establish_callback(evutil_socket_t evsock,
+        __attribute__((unused))short flags, void *evdata) {
 
     int fd;
     struct sockaddr_storage remote;
     socklen_t size = sizeof(remote);
+    amp_control_t *control = evdata;
 
     Log(LOG_DEBUG, "Got new control connection");
 
-    if ( (fd = accept(eventfd, (struct sockaddr *)&remote, &size)) < 0 ) {
+    if ( (fd = accept(evsock, (struct sockaddr *)&remote, &size)) < 0 ) {
         Log(LOG_WARNING, "Failed to accept connection on control socket: %s",
                 strerror(errno));
         return;
     }
 
-    wand_add_fd(ev_hdl, fd, EV_READ, data, control_read_callback);
+    /*
+     * this event does not have the persist flag so it shall only run the
+     * first time
+     */
+    struct acl_event *acl_e = malloc(sizeof (struct acl_event));
+    acl_e->acl = control->acl;
+    acl_e->control_read = event_new(control->base, fd,
+        EV_READ, control_read_callback, acl_e);
+    event_add(acl_e->control_read, NULL);
 
     return;
 }
@@ -488,9 +526,7 @@ static void control_establish_callback(wand_event_handler_t *ev_hdl,
  * use separate sockets for IPv4 and IPv6 so that we can have each of them
  * listening on specific, different addresses.
  */
-int initialise_control_socket(wand_event_handler_t *ev_hdl,
-        amp_control_t *control) {
-
+int initialise_control_socket(struct event_base *base, amp_control_t *control) {
     struct addrinfo *addr4, *addr6;
     int one = 1;
     char addrstr[INET6_ADDRSTRLEN];
@@ -502,6 +538,8 @@ int initialise_control_socket(wand_event_handler_t *ev_hdl,
         Log(LOG_WARNING, "No control socket configuration");
         return -1;
     }
+
+    control->base = base;
 
     sockets.socket = -1;
     sockets.socket6 = -1;
@@ -623,14 +661,16 @@ int initialise_control_socket(wand_event_handler_t *ev_hdl,
 
     /* if we have an ipv4 socket then set up the event listener */
     if ( sockets.socket > 0 ) {
-        wand_add_fd(ev_hdl, sockets.socket, EV_READ, control->acl,
-                control_establish_callback);
+        control->socket = event_new(base, sockets.socket,
+            EV_READ|EV_PERSIST, control_establish_callback, control);
+        event_add(control->socket, NULL);
     }
 
     /* if we have an ipv6 socket then set up the event listener */
     if ( sockets.socket6 > 0 ) {
-        wand_add_fd(ev_hdl, sockets.socket6, EV_READ, control->acl,
-                control_establish_callback);
+        control->socket6 = event_new(base, sockets.socket6,
+            EV_READ|EV_PERSIST, control_establish_callback, control);
+        event_add(control->socket6, NULL);
     }
 
     return 0;
@@ -651,5 +691,7 @@ void free_control_config(amp_control_t *control) {
     if ( control->ipv6 ) free(control->ipv6);
     if ( control->port ) free(control->port);
     if ( control->acl ) free_acl(control->acl);
+    if ( control->socket ) event_free(control->socket);
+    if ( control->socket6 ) event_free(control->socket6);
     free(control);
 }

@@ -7,16 +7,15 @@ testdir=$(libdir)/$(PACKAGE)/tests
 
 bin_PROGRAMS=amp-dns
 amp_dns_SOURCES=../testmain.c
-amp_dns_LDADD=dns.la -L../../common/ -lamp -lprotobuf-c -lunbound -lwandevent
-amp_dns_LDFLAGS=-Wl,--no-as-needed
+amp_dns_LDADD=dns.la -L../../common/ -lamp -lprotobuf-c -lunbound -levent
 
 test_LTLIBRARIES=dns.la
 dns_la_SOURCES=dns.c
 nodist_dns_la_SOURCES=dns.pb-c.c
-dns_la_LDFLAGS=-module -avoid-version -L../../common/ -lamp -lprotobuf-c -lwandevent
+dns_la_LDFLAGS=-module -avoid-version -L../../common/ -lamp -lprotobuf-c -levent
 
 INCLUDES=-I../ -I../../common/
 
-dns.pb-c.c: Makefile
+dns.pb-c.c: dns.proto
 	protoc-c --c_out=. dns.proto
 	protoc --python_out=../python/ampsave/tests/ dns.proto

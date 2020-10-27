@@ -1,3 +1,199 @@
+amplet2 (0.10.6-1) unstable; urgency=low
+
+  * amplet2: Replace function that waits for DNS responses with ub_wait().
+  * amplet2: Replace 32bit IPv6 accessors with 16bit when comparing addresses.
+  * amplet2: Remove unbound DNS context from global variable structure.
+  * http: Don't call libcurl functions from within libcurl callbacks.
+  * http: Pass a string to the lexer rather than piping data to yyin.
+  * standalone tests: Call register function directly rather than using dlsym.
+
+ -- Brendon Jones <brendonj@waikato.ac.nz>  Fri, 11 Sep 2020 15:50:26 +1200
+
+amplet2 (0.10.5-1) unstable; urgency=low
+
+  * amplet2: Zero control struct before use, preventing a crash on exit.
+  * amplet2: Check socket options exist before trying to compile them.
+  * amplet2: Replace index() and rindex() with strchr() and strrchr().
+  * package: Conflict with old amplet2-chromium-libs packages.
+  * package: Suggest amplet2-client-sip and amplet2-client-youtube packages.
+
+ -- Brendon Jones <brendonj@waikato.ac.nz>  Wed, 26 Aug 2020 11:16:16 +1200
+
+amplet2 (0.10.4-1) unstable; urgency=low
+
+  * sip: Allow test to take both a URI and a normal target.
+  * sip: Update man page with new options.
+  * sip: Remove (unused) "family" from result dict, to match other tests.
+  * traceroute: Don't increment TTL if already at the maximum path length.
+
+ -- Brendon Jones <brendonj@waikato.ac.nz>  Fri,  3 Jul 2020 15:23:25 +1200
+
+amplet2 (0.10.3-1) unstable; urgency=low
+
+  * amplet2: Allow setting default parameters for servers started by tests.
+  * amplet2: Allow including other files in the client configuration file.
+  * sip: Fix copy and paste error in mutex name.
+  * sip: Start remote server before initialising pjsip locally.
+  * sip: Cleanup and return more often rather than exiting with error.
+
+ -- Brendon Jones <brendonj@waikato.ac.nz>  Thu, 28 May 2020 10:40:43 +1200
+
+amplet2 (0.10.2-1) unstable; urgency=low
+
+  * amplet2: Switch to using libevent rather than libwandevent (#41).
+  * amplet2: Set server name indication on rabbitmq shovels.
+  * fastping: Free percentile data in summary structures when finished.
+  * package: Set VCS fields in Debian control file.
+  * sip: Set minimum targets for test to zero (it could be a URI instead).
+  * sip: Correctly flag options as not having arguments.
+  * sip: Set DSCP bits, and send the option to the server too.
+  * sip: Add optional account registration.
+  * sip: Remove all codecs except PCMA/8000 and set clock rate to 8000Hz.
+  * sip: Fix incorrect loss percent/period used by SIP test to calculate MOS.
+  * sip: Fix use of original transport config instead of the duplicated one.
+  * sip: Ensure new 8000Hz wav file is part of the amplet2-client-sip package.
+  * standalone tests: Avoid shadowing test specific long options struct.
+
+ -- Brendon Jones <brendonj@waikato.ac.nz>  Fri, 22 May 2020 16:50:36 +1200
+
+amplet2 (0.10.1-1) unstable; urgency=low
+
+  * package: remove unnecessary /usr/sbin directory from debian install dirs.
+  * package: add extra dependency for amplet2-client-sip on Ubuntu Bionic.
+  * package: add extra build dependencies for amplet2-client-youtube package.
+  * youtube: build a separate deb package containing the youtube test.
+  * youtube: don't print test timing results if they aren't set.
+
+ -- Brendon Jones <brendonj@waikato.ac.nz>  Mon, 30 Mar 2020 15:10:43 +1300
+
+amplet2 (0.10.0-1) unstable; urgency=low
+
+  * amplet2: move standalone test binaries from /usr/sbin to /usr/bin/.
+  * sip: fix building the test with older libpjsip packages.
+  * sip: fix building the test on armhf and arm64 architectures.
+  * sip: build a separate {deb,rpm} package containing the sip test.
+  * udpstream: link the test with -lm again.
+
+ -- Brendon Jones <brendonj@waikato.ac.nz>  Tue, 24 Mar 2020 09:47:14 +1300
+
+amplet2 (0.9.14-1) unstable; urgency=low
+
+  * package: no longer build transitional package amplet2-client-lite.
+  * package: add Debian/Ubuntu arm64 to the list of GitLab CI/CD build targets.
+  * sip: add new SIP/RTP test, currently disabled by default.
+
+ -- Brendon Jones <brendonj@waikato.ac.nz>  Tue, 10 Mar 2020 10:44:14 +1300
+
+amplet2 (0.9.13-1) unstable; urgency=low
+
+  * dns: use SO_TIMESTAMPING to get timestamps for sent packets (#35).
+  * fastping: use SO_TIMESTAMPING to get timestamps for sent packets (#35).
+  * icmp: use SO_TIMESTAMPING to get timestamps for sent packets (#35).
+  * tcpping: use SO_TIMESTAMPING to get timestamps for sent packets (#35).
+  * traceroute: use SO_TIMESTAMPING to get timestamps for sent packets (#35).
+  * udpstream: fix incorrect test name in error message.
+  * amplet2: make shovel prefetch-count configurable, set to 1 by default (#38).
+
+ -- Brendon Jones <brendonj@waikato.ac.nz>  Mon, 24 Feb 2020 16:54:56 +1300
+
+amplet2 (0.9.12-1) unstable; urgency=low
+
+  * amplet2: add workaround for setsockopt failure under non-amd64 qemu/docker.
+
+ -- Brendon Jones <brendonj@waikato.ac.nz>  Thu, 14 Nov 2019 13:19:55 +1300
+
+amplet2 (0.9.11-1) unstable; urgency=low
+
+  * dns: avoid waiting for LOSS_TIMEOUT if no packets are outstanding.
+  * dns: only count DNS query length if the query was actually sent.
+  * fastping: be stricter in checking before reporting parts of results.
+  * fastping: ignore duplicate responses.
+  * fastping: limit valid fastping sequence numbers to those sent.
+  * fastping: check length of data when validating fastping response.
+  * fastping: add more debugging output.
+  * fastping: apply a BPF filter to restrict incoming response packets.
+  * fastping: sleep less at low sending rates.
+  * http: ensure server/object/global start/end times always get set.
+  * http: total object count should also include failed objects.
+  * icmp: avoid waiting for LOSS_TIMEOUT if no packets are outstanding.
+  * tcpping: avoid waiting for LOSS_TIMEOUT if no packets are outstanding.
+  * throughput: avoid using default protobuf values for runtime and bytes.
+  * traceroute: fix reporting too many non-responsive hops.
+  * traceroute: don't connect to whois server with no addresses to query.
+  * udpstream: be stricter in checking before reporting parts of results.
+  * all tests: update to accept unresolved hostnames as destinations.
+
+ -- Brendon Jones <brendonj@waikato.ac.nz>  Wed, 23 Oct 2019 16:46:37 +1300
+
+amplet2 (0.9.10-1) unstable; urgency=low
+
+  * dns: fix incorrect test name in error message.
+  * amplet2: explicitly set protocol buffer version 2 in .proto files.
+  * amplet2: replace deprecated ASN1_STRING_data() with ASN1_STRING_get0_data().
+  * amplet2: replace deprecated RSA_generate_key() with RSA_generate_key_ex().
+
+ -- Brendon Jones <brendonj@waikato.ac.nz>  Mon, 19 Aug 2019 16:10:24 +1200
+
+amplet2 (0.9.9-1) unstable; urgency=low
+
+  * package: version the init-system-helpers dependency to appease lintian.
+  * amplet2: set CAP_NET_ADMIN to run tcpping test.
+  * amplet2: set CAP_NET_BIND_SERVICE to run throughput and udpstream tests.
+  * tcpping: set CAP_NET_ADMIN to allow pcap capture.
+  * throughput: set CAP_NET_BIND_SERVICE to allow binding to low ports.
+  * udpstream: set CAP_NET_BIND_SERVICE to allow binding to low ports.
+
+ -- Brendon Jones <brendonj@waikato.ac.nz>  Thu, 11 Jul 2019 17:07:19 +1200
+
+amplet2 (0.9.8-1) unstable; urgency=low
+
+  * package: create directories during postinst rather than in init scripts.
+  * amplet2: start as root to run rabbitmqctl before switching to amplet user.
+
+ -- Brendon Jones <brendonj@waikato.ac.nz>  Fri,  5 Jul 2019 16:43:18 +1200
+
+amplet2 (0.9.7-1) unstable; urgency=low
+
+  * amplet2: run all test processes as a non-privileged user.
+  * amplet2: update man pages with capabilities and links to other programs.
+  * udpstream: fix incorrect test name in error message.
+
+ -- Brendon Jones <brendonj@waikato.ac.nz>  Wed,  3 Jul 2019 13:42:19 +1200
+
+amplet2 (0.9.6-1) unstable; urgency=low
+
+  * external: drop all groups before setting user/group to "nobody" (#33).
+  * external: add missing man page to package.
+  * fastping: add missing man page to package.
+  * fastping: link libm correctly with the test library.
+
+ -- Brendon Jones <brendonj@waikato.ac.nz>  Thu, 13 Jun 2019 17:21:15 +1200
+
+amplet2 (0.9.5-1) unstable; urgency=low
+
+  * external: enable test by default (#33).
+
+ -- Brendon Jones <brendonj@waikato.ac.nz>  Tue, 11 Jun 2019 17:18:35 +1200
+
+amplet2 (0.9.4-1) unstable; urgency=low
+
+  * amplet2: add new test to run external programs (temporarily disabled) (#33).
+  * package: remove Debian Wheezy build scripts and sysvinit/upstart (#31).
+  * fastping: fix incorrect test name on man page.
+  * youtube: use strictly incrementing javascript timer.
+
+ -- Brendon Jones <brendonj@waikato.ac.nz>  Thu,  9 May 2019 11:55:59 +1200
+
+amplet2 (0.9.3-1) unstable; urgency=low
+
+  * fastping: enable test by default (#26).
+  * fastping: add missing header to the distribution tarball.
+  * fastping: change result fields to better match backend expectations.
+  * fastping: change offset into fastping packet depending on address family.
+  * fastping: sleep at low packet rates when possible.
+
+ -- Brendon Jones <brendonj@waikato.ac.nz>  Thu, 11 Apr 2019 14:51:27 +1200
+
 amplet2 (0.9.2-1) unstable; urgency=low
 
   * youtube: set chromium UserDataDir to /tmp/.amplet2/chromium/ (#29).

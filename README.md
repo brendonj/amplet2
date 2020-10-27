@@ -1,13 +1,17 @@
 # amplet2
 
-amplet2 is the client portion of the
-[AMP active measurement system](http://amp.wand.net.nz), and is responsible
+The [AMP active measurement system](http://amp.wand.net.nz) is a set of
+software that is designed to perform continuous, distributed, black-box active
+network measurement.
+
+amplet2 is the client portion of the AMP system, and is responsible
 for performing the measurements - it should be run on each of the measurement
-probes. Each client independently schedules and runs tests, acts as a
-cooperative endpoint for tests run by other probes, and reports test results to
+hosts. Each client independently schedules and runs tests, acts as a
+cooperative endpoint for tests run by other hosts, and reports test results to
 a central collector for analysis and display.
 
-Prebuilt .deb packages are available at https://dl.bintray.com/wand/amp/. The
+Prebuilt .deb packages are available at https://dl.bintray.com/wand/amp/ and
+RPM packages for Centos 7 at https://dl.bintray.com/wand/amp-rpm/. The
 [amplet2 wiki](https://github.com/wanduow/amplet2/wiki) contains instructions
 on [installing the amplet2 client](https://github.com/wanduow/amplet2/wiki/Installing-the-Amplet2-Client) using these packages.
 
@@ -30,6 +34,9 @@ and protocols. Tests currently available include:
  * UDP traceroute
  * TCP throughput
  * HTTP performance
+ * YouTube performance
+ * SIP/RTP performance
+ * Other simple, non-amplet2 programs
 
 
 ## Documentation

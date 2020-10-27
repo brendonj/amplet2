@@ -48,6 +48,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <unbound.h>
 #include <sys/socket.h>
 
 #include "debug.h"
@@ -59,8 +60,10 @@
 #include "testlib.h"
 #include "../measured/control.h" /* just for CONTROL_PORT */
 
+/* function all test modules must define to register themselves */
+test_t *register_test(void);
 
-struct option long_options[] = {
+struct option standalone_long_options[] = {
     {"cacert", required_argument, 0, '0'},
     {"cert", required_argument, 0, '9'},
     {"key", required_argument, 0, '8'},
@@ -92,7 +95,6 @@ int main(int argc, char *argv[]) {
     int opt;
     int i;
     char *nameserver = NULL;
-    int remaining = 0;
     pthread_mutex_t addrlist_lock;
     int forcev4 = 0;
     int forcev6 = 0;
@@ -102,9 +104,10 @@ int main(int argc, char *argv[]) {
     int test_argc;
     char **test_argv;
     int do_ssl;
+    struct ub_ctx *dns_ctx;
 
-    /* load information about the test, including the callback functions */
-    test_info = register_one_test(NULL);
+    /* there should be only a single test linked, so register it directly */
+    test_info = register_test();
 
     /* suppress "invalid argument" errors from getopt */
     opterr = 0;
@@ -125,7 +128,7 @@ int main(int argc, char *argv[]) {
      * known argument, but for some reason the permutation isn't working?
      */
     while ( (opt = getopt_long(argc, argv, "-x0:9:8:7:4::6::",
-                    long_options, NULL)) != -1 ) {
+                    standalone_long_options, NULL)) != -1 ) {
 	/* generally do nothing, just use up arguments until the -- marker */
         switch ( opt ) {
             /* -x is an option only we care about for now - enable debug */
@@ -191,12 +194,12 @@ int main(int argc, char *argv[]) {
     /* set the nameserver to our custom one if specified */
     if ( nameserver ) {
         /* TODO we could parse the string and get up to MAXNS servers */
-        vars.ctx = amp_resolver_context_init(&nameserver, 1, sourcev4,sourcev6);
+        dns_ctx = amp_resolver_context_init(&nameserver, 1, sourcev4,sourcev6);
     } else {
-        vars.ctx = amp_resolver_context_init(NULL, 0, sourcev4, sourcev6);
+        dns_ctx = amp_resolver_context_init(NULL, 0, sourcev4, sourcev6);
     }
 
-    if ( vars.ctx == NULL ) {
+    if ( dns_ctx == NULL ) {
         Log(LOG_ALERT, "Failed to configure resolver, aborting.");
         exit(EXIT_FAILURE);
     }
@@ -227,13 +230,14 @@ int main(int argc, char *argv[]) {
             family = AF_UNSPEC;
         }
 
-        amp_resolve_add(vars.ctx, &addrlist, &addrlist_lock, argv[i],
-                family, -1, &remaining);
+        /* TODO update max targets and pass through to the resolver? */
+        amp_resolve_add(dns_ctx, &addrlist, &addrlist_lock, argv[i],
+                family, -1);
     }
 
-    if ( remaining > 0 ) {
+    if ( optind < argc ) {
         /* wait for all the responses to come in */
-        amp_resolve_wait(vars.ctx, &addrlist_lock, &remaining);
+        ub_wait(dns_ctx);
     }
 
     /* add all the results of to the list of destinations */
@@ -330,13 +334,12 @@ int main(int argc, char *argv[]) {
 
     free(test_argv);
 
-    ub_ctx_delete(vars.ctx);
+    ub_ctx_delete(dns_ctx);
 
     if ( ssl_ctx != NULL ) {
         ssl_cleanup();
     }
 
-    dlclose(test_info->dlhandle);
     free(test_info->name);
     free(test_info);
 

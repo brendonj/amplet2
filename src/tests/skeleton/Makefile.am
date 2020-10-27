@@ -8,7 +8,6 @@ testdir=$(libdir)/$(PACKAGE)/tests
 bin_PROGRAMS=amp-skeleton
 amp_skeleton_SOURCES=../testmain.c
 amp_skeleton_LDADD=skeleton.la -L../../common/ -lamp -lprotobuf-c -lunbound
-amp_skeleton_LDFLAGS=-Wl,--no-as-needed
 
 test_LTLIBRARIES=skeleton.la
 skeleton_la_SOURCES=skeleton.c
@@ -17,6 +16,6 @@ skeleton_la_LDFLAGS=-module -avoid-version -L../../common/ -lamp -lprotobuf-c
 
 INCLUDES=-I../ -I../../common/
 
-skeleton.pb-c.c: Makefile
+skeleton.pb-c.c: skeleton.proto
 	protoc-c --c_out=. skeleton.proto
 	protoc --python_out=../python/ampsave/tests/ skeleton.proto

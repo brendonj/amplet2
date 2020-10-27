@@ -69,6 +69,8 @@
             ((tva).tv_usec - (tvb).tv_usec) ) \
         )
 
+/* maximum value of fd that will track packet sent counts (for TX timestamps) */
+#define MAX_TX_TIMESTAMP_FD 64
 
 /*
  * Structure combining the ipv4 and ipv6 network sockets so that they can be
@@ -77,6 +79,13 @@
 struct socket_t {
     int socket;                 /* ipv4 socket, if available */
     int socket6;                /* ipv6 socket, if available */
+};
+
+/* Structure representing the SO_TIMESTAMPING return value within CMSG. */
+struct timestamping_t {
+    struct timespec software;   /* software timestamp, if avaliabe */
+    struct timespec deprecated; /* deprecated */
+    struct timespec hardware;   /* hardware timestamp, if avaliabe */
 };
 
 void set_proc_name(char *testname);
@@ -89,8 +98,8 @@ int delay_send_packet(int sock, char *packet, int size, struct addrinfo *dest,
         uint32_t inter_packet_delay, struct timeval *sent);
 char *address_to_name(struct addrinfo *address);
 int compare_addresses(const struct sockaddr *a,
-        const struct sockaddr *b, int len);
-struct addrinfo *get_numeric_address(char *interface, char *port);
+        const struct sockaddr *b, uint8_t len);
+struct addrinfo *get_numeric_address(char *address, char *port);
 int bind_socket_to_device(int sock, char *device);
 int bind_sockets_to_device(struct socket_t *sockets, char *device);
 int bind_socket_to_address(int sock, struct addrinfo *address);

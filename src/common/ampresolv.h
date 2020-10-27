@@ -53,13 +53,19 @@
 #define UNIX_PATH_MAX 108
 #endif
 
+enum amp_resolve_status {
+    AMP_RESOLVE_WAITING = 0,
+    AMP_RESOLVE_OK = 1,
+};
+
 /* data block for callback function when name resolution is complete */
 struct amp_resolve_data {
     pthread_mutex_t *lock;
     int max;                    /* maximum number of results to return */
     int qcount;                 /* how many requests for name, shared max */
-    int *remaining;             /* total requests for test, shared addrlist */
+    enum amp_resolve_status status; /* have we got a good response yet? */
     struct addrinfo **addrlist; /* list to store the results in */
+    uint8_t family;             /* address family that was queried */
 };
 
 /* data block used to transfer information about a query to be performed */
@@ -85,10 +91,7 @@ typedef struct resolve_dest resolve_dest_t;
 struct ub_ctx *amp_resolver_context_init(char *servers[], int nscount,
         char *sourcev4, char *sourcev6);
 void amp_resolve_add(struct ub_ctx *ctx, struct addrinfo **res,
-        pthread_mutex_t *addrlist_lock, char *name, int family, int max,
-        int *remaining);
-void amp_resolve_wait(struct ub_ctx *ctx, pthread_mutex_t *lock,
-        int *remaining);
+        pthread_mutex_t *addrlist_lock, char *name, int family, int max);
 void amp_resolve_freeaddr(struct addrinfo *addrlist);
 void amp_resolver_context_delete(struct ub_ctx *ctx);
 

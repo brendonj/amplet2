@@ -107,8 +107,12 @@ static int set_and_verify_sockopt(int sock, int value, int proto,
         return -1;
     }
 
-    if ( proto == SOL_SOCKET && (opt == SO_RCVBUF || opt == SO_SNDBUF ||
-                opt == SO_RCVBUFFORCE || opt == SO_SNDBUFFORCE) ) {
+#ifdef SO_SNDBUF
+    if ( proto == SOL_SOCKET && (opt == SO_RCVBUF || opt == SO_SNDBUF
+#ifdef SO_SNDBUFFORCE
+                || opt == SO_RCVBUFFORCE || opt == SO_SNDBUFFORCE
+#endif
+                ) ) {
         /* buffer sizes will be set to twice what was asked for */
         if ( value != verify / 2 ) {
             Log(LOG_WARNING,
@@ -116,7 +120,9 @@ static int set_and_verify_sockopt(int sock, int value, int proto,
                     "got %d, expected %d", optname, verify, value);
             return -1;
         }
-    } else if ( value != verify ) {
+    } else
+#endif
+    if ( value != verify ) {
         /* all other values should match what was requested */
         Log(LOG_WARNING,
                 "getsockopt() reports incorrect value for %s after setting:"
@@ -383,7 +389,7 @@ int start_listening(struct socket_t *sockets, int port,
  * be started. The connection to the remote client should already be
  * established by this point.
  */
-static int send_server_start(BIO *ctrl, uint64_t type) {
+static int send_server_start(BIO *ctrl, uint64_t type, char *params) {
     int len;
     void *buffer;
     int result;
@@ -392,6 +398,7 @@ static int send_server_start(BIO *ctrl, uint64_t type) {
 
     server.has_test_type = 1;
     server.test_type = type;
+    server.params = params;
 
     msg.server = &server;
     msg.has_type = 1;
@@ -692,13 +699,13 @@ BIO* connect_control_server(struct addrinfo *dest, uint16_t port,
  * Ask that a remote amplet client that we are connected to start a server
  * for a particular test.
  */
-int start_remote_server(BIO *ctrl, uint64_t type) {
+int start_remote_server(BIO *ctrl, uint64_t type, char *params) {
 
     assert(ctrl);
 
     /* Send the test type, so the other end knows which server to run */
     /* TODO send any test parameters? */
-    if ( send_server_start(ctrl, type) < 0 ) {
+    if ( send_server_start(ctrl, type, params) < 0 ) {
         Log(LOG_DEBUG, "Failed to send test type");
         return -1;
     }

@@ -50,4 +50,6 @@ __all__ = [
     "udpstream",
     "youtube",
     "fastping",
+    "external",
+    "sip",
 ]

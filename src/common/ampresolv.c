@@ -100,14 +100,57 @@ struct ub_ctx *amp_resolver_context_init(char *servers[], int nscount,
 
     /* use only the given outgoing interfaces if they have been specified */
     if ( sourcev4 ) {
-        ub_ctx_set_option(ctx, "outgoing-interface", sourcev4);
+        ub_ctx_set_option(ctx, "outgoing-interface:", sourcev4);
     }
 
     if ( sourcev6 ) {
-        ub_ctx_set_option(ctx, "outgoing-interface", sourcev6);
+        ub_ctx_set_option(ctx, "outgoing-interface:", sourcev6);
     }
 
     return ctx;
+}
+
+
+
+/*
+ * Build a struct addrinfo from one set of data returned by the unbound query.
+ */
+static struct addrinfo* build_addrinfo(int qtype, char *qname, char *data,
+        int datalen) {
+
+        struct addrinfo *item = calloc(1, sizeof(struct addrinfo));
+
+        switch ( qtype ) {
+            case 0x01:
+                item->ai_family = AF_INET;
+                if ( data ) {
+                    item->ai_addrlen = sizeof(struct sockaddr_in);
+                    item->ai_addr = calloc(1, item->ai_addrlen);
+                    item->ai_addr->sa_family = AF_INET;
+                    memcpy(&((struct sockaddr_in*)item->ai_addr)->sin_addr,
+                            data, datalen);
+                }
+                break;
+
+            case 0x1c:
+                item->ai_family = AF_INET6;
+                if ( data ) {
+                    item->ai_addrlen = sizeof(struct sockaddr_in6);
+                    item->ai_addr = calloc(1, item->ai_addrlen);
+                    item->ai_addr->sa_family = AF_INET6;
+                    memcpy(&((struct sockaddr_in6*)item->ai_addr)->sin6_addr,
+                            data, datalen);
+                }
+                break;
+
+            default:
+                item->ai_family = AF_UNSPEC;
+                break;
+        };
+
+        item->ai_canonname = strdup(qname);
+
+        return item;
 }
 
 
@@ -125,85 +168,73 @@ static void amp_resolve_callback(void *d, int err, struct ub_result *result) {
     int qcount;
     int i;
 
+    assert(result);
+
     /* lock the data block, we are about to update the address list */
     pthread_mutex_lock(data->lock);
 
     assert(data->qcount > 0);
-    assert(*data->remaining > 0);
 
-    if ( err != 0 || result == NULL || !result->havedata ) {
+    if ( err != 0 || !result->havedata ) {
+        Log(LOG_DEBUG, "Failed query %s (%x)", result->qname, result->qtype);
         if ( err != 0 ) {
             Log(LOG_DEBUG, "Resolve error: %s\n", ub_strerror(err));
-        } else if ( result ) {
-            Log(LOG_DEBUG, "No results for query %s (%x)", result->qname,
-                    result->qtype);
         } else {
-            Log(LOG_DEBUG, "Unknown error while resolving");
+            Log(LOG_DEBUG, "No results returned");
+        }
+    } else {
+        Log(LOG_DEBUG, "Got a DNS response for %s (%x)", result->qname,
+                result->qtype);
+
+        /*
+         * Loop over all the results until we hit max or run out of results.
+         * Note that max is shared between the A and AAAA queries (if present)
+         * so that only that many results will be returned for the one name.
+         */
+        for ( i = 0; result->data[i] != NULL &&
+                (data->max == -1 || data->max > 0); i++ ) {
+
+            item = build_addrinfo(result->qtype, result->qname,
+                    result->data[i], result->len[i]);
+            item->ai_next = *data->addrlist;
+            *data->addrlist = item;
+
+            /* consume a target if we care about the maximum number of them */
+            if ( data->max > 0 ) {
+                data->max--;
+            }
         }
 
-        goto end;
+        data->status = AMP_RESOLVE_OK;
     }
-
-    Log(LOG_DEBUG, "Got a DNS response for %s (%x)", result->qname,
-            result->qtype);
-
-    /*
-     * Loop over all the results until we hit max or run out of results. Note
-     * that max is shared between the A and AAAA queries (if present) so that
-     * only that many results will be returned for the one name.
-     */
-    for ( i = 0; result->data[i] != NULL &&
-            (data->max == -1 || data->max > 0); i++ ) {
-
-        item = calloc(1, sizeof(struct addrinfo));
-
-        /* looks like we have to build the whole thing ourselves */
-        switch ( result->qtype ) {
-            case 0x01: item->ai_family = AF_INET;
-                       item->ai_addrlen = sizeof(struct sockaddr_in);
-                       item->ai_addr = calloc(1, item->ai_addrlen);
-                       item->ai_addr->sa_family = AF_INET;
-                       memcpy(&((struct sockaddr_in*)item->ai_addr)->sin_addr,
-                               result->data[i], result->len[i]);
-                       break;
-            case 0x1c: item->ai_family = AF_INET6;
-                       item->ai_addrlen = sizeof(struct sockaddr_in6);
-                       item->ai_addr = calloc(1, item->ai_addrlen);
-                       item->ai_addr->sa_family = AF_INET6;
-                       memcpy(&((struct sockaddr_in6*)item->ai_addr)->sin6_addr,
-                               result->data[i], result->len[i]);
-                       break;
-            default: Log(LOG_WARNING, "Unknown query response type");
-                     pthread_mutex_unlock(data->lock);
-                     assert(0);
-                     break;
-        };
-
-        //assert(item->ai_addr);
-        assert(result->qname);
-
-        item->ai_canonname = strdup(result->qname); /* vs canonname? */
-
-        /* prepend this item to the list */
-        item->ai_next = *data->addrlist;
-        *data->addrlist = item;
-
-        if ( data->max > 0 ) {
-            data->max--;
-        }
-    }
-
-end:
-    /* shared counter to track outstanding queries for this test */
-    (*data->remaining)--;
 
     /* get outstanding queries for this name while we still have it locked */
     qcount = --data->qcount;
 
     pthread_mutex_unlock(data->lock);
 
-    /* no outstanding queries for this name, can free the data block */
+    /*
+     * no outstanding queries for this name - make sure we got some sort of
+     * result and then free the data block
+     */
     if ( qcount <= 0 ) {
+        if ( data->status != AMP_RESOLVE_OK ) {
+            Log(LOG_DEBUG, "No results for %s, creating dummy entries",
+                    result->qname);
+
+            if ( data->family == AF_INET || data->family == AF_UNSPEC ) {
+                item = build_addrinfo(0x01, result->qname, NULL, 0);
+                item->ai_next = *data->addrlist;
+                *data->addrlist = item;
+            }
+
+            if ( data->family == AF_INET6 || data->family == AF_UNSPEC ) {
+                item = build_addrinfo(0x1c, result->qname, NULL, 0);
+                item->ai_next = *data->addrlist;
+                *data->addrlist = item;
+            }
+        }
+
         free(data);
     }
 
@@ -219,8 +250,7 @@ end:
  * TODO rename this? mostly used internally but testmain.c uses it too
  */
 void amp_resolve_add(struct ub_ctx *ctx, struct addrinfo **res,
-        pthread_mutex_t *addrlist_lock, char *name, int family, int max,
-        int *remaining) {
+        pthread_mutex_t *addrlist_lock, char *name, int family, int max) {
 
     struct amp_resolve_data *data;
     struct addrinfo *addr;
@@ -263,6 +293,7 @@ void amp_resolve_add(struct ub_ctx *ctx, struct addrinfo **res,
 
     /* otherwise send it to the resolver to be looked up */
     data = calloc(1, sizeof(struct amp_resolve_data));
+    data->status = AMP_RESOLVE_WAITING;
 
     /* keep a reference to the list of addresses we are building up */
     data->addrlist = res;
@@ -276,20 +307,12 @@ void amp_resolve_add(struct ub_ctx *ctx, struct addrinfo **res,
      * being used. This lets us share the max value between queries with the
      * same name and different address family.
      */
-    if ( family == AF_UNSPEC ) {
+    data->family = family;
+    if ( data->family == AF_UNSPEC ) {
         data->qcount = 2;
     } else {
         data->qcount = 1;
     }
-
-    /*
-     * Track how many queries are outstanding for this test process. When they
-     * are all complete, the test itself can begin.
-     */
-    pthread_mutex_lock(data->lock);
-    data->remaining = remaining;
-    *data->remaining += data->qcount;
-    pthread_mutex_unlock(data->lock);
 
     /*
      * Track a maximum number of address to resolve, shared between both IPv4
@@ -314,65 +337,6 @@ void amp_resolve_add(struct ub_ctx *ctx, struct addrinfo **res,
         ub_resolve_async(ctx, name, 0x1c, 0x01, (void*)data,
                 amp_resolve_callback, NULL);
     }
-}
-
-
-
-/*
- * Wait for all names used by this test to be resolved.
- */
-void amp_resolve_wait(struct ub_ctx *ctx, pthread_mutex_t *lock,
-        int *remaining) {
-    int fd;
-    int ready;
-    fd_set readset;
-    struct timeval timeout;
-
-    assert(ctx);
-    assert(lock);
-    assert(remaining);
-
-    Log(LOG_DEBUG, "Waiting for outstanding DNS requests");
-
-    /* using the file descriptor directly lets us use select() for timeouts */
-    if ( (fd = ub_fd(ctx)) < 0 ) {
-        Log(LOG_WARNING, "Failed to get resolver file descriptor");
-        return;
-    }
-
-    do {
-	/* fd sets are undefined after an error, so set them every time */
-	FD_ZERO(&readset);
-        FD_SET(fd, &readset);
-
-        /*
-         * Reset the timeout, even if we had an error. Not worth the hassle
-         * of calculating how much time was left when error occurred.
-         */
-        timeout.tv_sec = 0;
-        timeout.tv_usec = MAX_DNS_POLL_USEC;
-
-        ready = select(fd+1, &readset, NULL, NULL, &timeout);
-
-        /* if the fd is available for reading, process the callbacks */
-        if ( ready > 0 ) {
-            ub_process(ctx);
-        }
-
-        /*
-         * Check if any of the threads have finished processing data for this
-         * particular test. We can stop waiting as soon as all of our names
-         * have been resolved.
-         */
-        pthread_mutex_lock(lock);
-        if ( *remaining <= 0 ) {
-            pthread_mutex_unlock(lock);
-            break;
-        }
-        pthread_mutex_unlock(lock);
-
-    } while ( ready >= 0 || (ready < 0 && errno == EINTR) );
-
 }
 
 
@@ -514,14 +478,14 @@ struct addrinfo *amp_resolve_get_list(int fd) {
         tmp->ai_socktype = item.ai_socktype;
         tmp->ai_protocol = item.ai_protocol;
         tmp->ai_addrlen = item.ai_addrlen;
-        tmp->ai_addr = calloc(1, tmp->ai_addrlen);
 
-        assert(tmp->ai_addrlen > 0);
-        assert(tmp->ai_addr);
-
-        if ( recv(fd, tmp->ai_addr, tmp->ai_addrlen, 0) <= 0 ) {
-            free(tmp);
-            break;
+        /* there might not be an address for this name */
+        if ( tmp->ai_addrlen > 0 ) {
+            tmp->ai_addr = calloc(1, tmp->ai_addrlen);
+            if ( recv(fd, tmp->ai_addr, tmp->ai_addrlen, 0) <= 0 ) {
+                free(tmp);
+                break;
+            }
         }
 
         if ( recv(fd, &namelen, sizeof(namelen), 0) <= 0 ) {
